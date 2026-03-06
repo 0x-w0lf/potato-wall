@@ -1,0 +1,18 @@
+post_install() {
+  echo "Configuring potato-wall for the first time..."
+  systemctl enable ufw.service
+
+  # Apply Level 1 Hardening immediately
+  /usr/bin/potato-wall --hardening-level 1
+
+  echo "====================================================="
+  echo " potato-wall installed successfully!"
+  echo " System has been hardened (Level 1) by default."
+  echo " Run 'sudo potato-wall --add-ssid' to add"
+  echo " your current network to the trusted list."
+  echo "====================================================="
+}
+
+post_upgrade() {
+  post_install
+}

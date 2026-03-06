@@ -1,0 +1,10 @@
+# Ignorar carpetas de construcción de Arch
+pkg/
+src/
+
+# Ignorar el paquete compilado
+*.pkg.tar.zst
+
+# Ignorar logs y temporales
+*.log
+.DS_Store

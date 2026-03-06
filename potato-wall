@@ -1,0 +1,184 @@
+#!/bin/bash
+
+# ==============================================================================
+# potato-wall - Dynamic Network Security Manager
+# ==============================================================================
+
+UFW="/usr/sbin/ufw"
+SYSTEMCTL="/usr/bin/systemctl"
+RESOLVECTL="/usr/bin/resolvectl"
+
+ACTUAL_USER=${SUDO_USER:-$USER}
+USER_HOME=$(eval echo ~$ACTUAL_USER)
+CONFIG_DIR="$USER_HOME/.config/potato-wall"
+WHITELIST="$CONFIG_DIR/whitelist.txt"
+
+if [ "$EUID" -ne 0 ] && [ "$1" != "--help" ] && [ "$1" != "-h" ]; then
+  echo "Error: potato-wall requires superuser privileges (sudo)."
+  exit 1
+fi
+
+show_help() {
+  echo "Usage: potato-wall [OPTION]"
+  echo "Network security policy manager."
+  echo ""
+  echo "Options:"
+  echo "  --check                 Check current network state and firewall posture"
+  echo "  --home                  Apply relaxed policies for trusted networks"
+  echo "  --hardening-level [1-3] Apply hardening level (1: Basic, 2: Egress Control, 3: Ghost Mode)"
+  echo "  --add-ssid [SSID]       Add a network to your personal trusted list"
+  echo "  --help                  Display this message"
+}
+
+add_ssid() {
+  local NEW_SSID="$1"
+
+  if [ -z "$NEW_SSID" ]; then
+    NEW_SSID=$(nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2)
+
+    if [ -z "$NEW_SSID" ]; then
+      echo "Not currently connected to any Wi-Fi network."
+      read -p "Please enter the SSID manually: " NEW_SSID
+    fi
+  fi
+
+  if [ -z "$NEW_SSID" ]; then
+    echo "Error: Network name (SSID) cannot be empty."
+    exit 1
+  fi
+
+  if [ ! -d "$CONFIG_DIR" ]; then
+    mkdir -p "$CONFIG_DIR"
+    chown -R "$ACTUAL_USER:$ACTUAL_USER" "$CONFIG_DIR"
+  fi
+  if [ ! -f "$WHITELIST" ]; then
+    touch "$WHITELIST"
+    chown "$ACTUAL_USER:$ACTUAL_USER" "$WHITELIST"
+  fi
+
+  if grep -Fxq "$NEW_SSID" "$WHITELIST"; then
+    echo "SSID '$NEW_SSID' already exists in your trusted list."
+  else
+    echo "$NEW_SSID" >>"$WHITELIST"
+    echo "✅ SSID '$NEW_SSID' successfully added to $WHITELIST"
+  fi
+}
+
+check_status() {
+  echo "Auditing firewall posture and connectivity..."
+  CURRENT_SSID=$(nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2)
+  CURRENT_SSID=${CURRENT_SSID:-"Unknown / LAN"}
+
+  UFW_STATUS=$($UFW status verbose)
+
+  if echo "$UFW_STATUS" | grep -q "Status: inactive"; then
+    echo -e "\n🔴 STATE: VULNERABLE | Network: $CURRENT_SSID"
+    exit 1
+  fi
+
+  DEFAULT_DENY_IN=$(echo "$UFW_STATUS" | grep "Default:" | grep -iq "deny (incoming)" && echo "yes" || echo "no")
+  DEFAULT_DENY_OUT=$(echo "$UFW_STATUS" | grep "Default:" | grep -iq "deny (outgoing)" && echo "yes" || echo "no")
+  LAN_ALLOW=$($UFW status | grep -E "ALLOW" | grep -E "192\.168\.|10\." >/dev/null && echo "yes" || echo "no")
+
+  # Lectura directa del kernel
+  STEALTH=$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null | tr -d '[:space:]')
+
+  if curl -s --retry 2 --connect-timeout 3 -I https://www.google.com 2>/dev/null | grep -iq "HTTP/"; then
+    NET="✅ FUNCTIONAL"
+  else
+    NET="❌ FAILED"
+  fi
+
+  echo -e "\n=================================================="
+  echo "🌐 Current Network: $CURRENT_SSID"
+  echo "🌍 Internet Access: $NET"
+
+  # La evaluación debe ir de lo más permisivo a lo más estricto para evitar falsos positivos
+  if [ "$LAN_ALLOW" == "yes" ]; then
+    echo "🏠 MODE:            HOME (Local traffic allowed)"
+  elif [ "$STEALTH" == "1" ]; then
+    echo "👻 MODE:            GHOST (Level 3 - Invisible to Pings, Controlled Egress)"
+  elif [ "$DEFAULT_DENY_OUT" == "yes" ]; then
+    echo "🔒 MODE:            STRICT (Level 2 - Controlled Egress)"
+  elif [ "$DEFAULT_DENY_IN" == "yes" ]; then
+    echo "🛡️  MODE:            SECURED (Level 1 - Perimeter Closed)"
+  else
+    echo "⚠️  MODE:            PERMISSIVE"
+  fi
+  echo -e "==================================================\n"
+}
+
+apply_hardening() {
+  LEVEL=$1
+  echo "Initiating Hardening Level $LEVEL..."
+
+  $UFW --force reset >/dev/null
+  $UFW logging off >/dev/null
+  $UFW default deny incoming >/dev/null
+
+  # Revert ghost mode by default (only active in lvl 3)
+  sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1
+  sysctl -w net.ipv4.tcp_syncookies=0 >/dev/null 2>&1
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
+
+  if [ "$LEVEL" == "1" ]; then
+    $UFW default allow outgoing >/dev/null
+
+  elif [ "$LEVEL" == "2" ] || [ "$LEVEL" == "3" ]; then
+    $UFW default deny outgoing >/dev/null
+    $UFW allow out 53,853/tcp >/dev/null
+    $UFW allow out 53/udp >/dev/null
+    $UFW allow out 80,443/tcp >/dev/null
+    $UFW allow out 123/udp >/dev/null
+
+    if [ "$LEVEL" == "3" ]; then
+      echo "Activating Level 3: Kernel Stealth (Ghost Mode)..."
+      # Uso explícito de sysctl -w
+      sysctl -w net.ipv4.icmp_echo_ignore_all=1 >/dev/null 2>&1
+      sysctl -w net.ipv4.tcp_syncookies=1 >/dev/null 2>&1
+      sysctl -w net.ipv4.conf.all.rp_filter=1 >/dev/null 2>&1
+    fi
+  else
+    echo "Error: Invalid level. Use 1, 2, or 3."
+    exit 1
+  fi
+
+  $UFW enable >/dev/null
+  chmod 640 /etc/ufw/*.rules 2>/dev/null
+  $SYSTEMCTL enable --now systemd-resolved >/dev/null
+
+  echo "✅ Hardening Level $LEVEL successfully applied."
+}
+
+apply_home() {
+  echo "Reverting to Home Mode..."
+  $UFW --force reset >/dev/null
+  $UFW default deny incoming >/dev/null
+  $UFW default allow outgoing >/dev/null
+  $UFW logging off >/dev/null
+  $UFW enable >/dev/null
+
+  $UFW allow in from 192.168.0.0/16 >/dev/null
+  $UFW allow in from 10.0.0.0/8 >/dev/null
+
+  sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1
+  sysctl -w net.ipv4.tcp_syncookies=0 >/dev/null 2>&1
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
+
+  echo "✅ Relaxed policies active."
+}
+
+# --- Main Router ---
+case "$1" in
+--check | -c) check_status ;;
+--home) apply_home ;;
+--hardening-level)
+  if [ -z "$2" ]; then
+    echo "Error: Missing level (e.g., potato-wall --hardening-level 1)"
+    exit 1
+  fi
+  apply_hardening "$2"
+  ;;
+--add-ssid) add_ssid "$2" ;;
+--help | -h | *) show_help ;;
+esac
